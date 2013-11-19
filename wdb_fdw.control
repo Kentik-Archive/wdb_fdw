@@ -1,0 +1,5 @@
+# WhiteDB FDW
+comment = 'WhiteDB Foreign Data Wrapper'
+default_version = '0.0.1'
+module_pathname = '$libdir/wdb_fdw'
+relocatable = true

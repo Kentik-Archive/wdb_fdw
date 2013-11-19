@@ -1,0 +1,3 @@
+*.o
+*.so
+sql/wdb_fdw--0.0.1.sql
