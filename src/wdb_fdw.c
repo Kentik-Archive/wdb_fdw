@@ -351,56 +351,6 @@ wdb_fdw_validator(PG_FUNCTION_ARGS) {
     PG_RETURN_VOID();
 }
 
-// Does ???
-/**
-static void
-getKeyBasedQual(Node *node, TupleDesc tupdesc, char **value, bool *key_based_qual) {
-    char *key = NULL;
-    *value = NULL;
-    *key_based_qual = false;
-
-    if (!node)
-        return;
-
-    if (IsA(node, OpExpr)) {
-        OpExpr *op = (OpExpr *) node;
-        Node *left,
-             *right;
-        Index varattno;
-
-        if (list_length(op->args) != 2)
-            return;
-
-        left = list_nth(op->args, 0);
-
-        if (!IsA(left, Var))
-            return;
-
-        varattno = ((Var *) left)->varattno;
-
-        right = list_nth(op->args, 1);
-
-        if (IsA(right, Const)) {
-
-            StringInfoData buf;
-
-            initStringInfo(&buf);
-
-            key = NameStr(tupdesc->attrs[varattno - 1]->attname);
-            *value = TextDatumGetCString(((Const *) right)->constvalue);
-
-            if (op->opfuncid == PROCID_TEXTEQ && strcmp(key, "key") == 0)
-                *key_based_qual = true;
-
-            return;
-        }
-    }
-
-    return;
-}
-*/
-
-
 static void wdbGetForeignRelSize(PlannerInfo *root,
         RelOptInfo *baserel,
         Oid foreigntableid) {
@@ -580,6 +530,7 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
     estate->db = NULL;
     estate->query = NULL;
     estate->numArgumentsInQuery = 0;
+    estate->lock_id = 0;
     node->fdw_state = (void *) estate;
 
     foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
@@ -593,6 +544,13 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
 
     /* initialize required state in fdw_private */
     estate->db = GetDatabase(&(estate->plan.opt));
+
+    if (estate->db == NULL) {
+        elog(ERROR,"Could not connect to a WhiteDB Database");
+    }
+
+    // Aquire a read lock for the duration of the scan.
+    estate->lock_id = wg_start_read(estate->db);
 
     /* OK, we connected. If this is an EXPLAIN, bail out now */
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -698,6 +656,9 @@ wdbEndForeignScan(ForeignScanState *node) {
 
     if(estate) {
         
+        // End the lock.
+        wg_end_read(estate->db, estate->lock_id);
+
         // Free any query structures we have.
         // @TODO -- figure out a way to free all the args we encoded as well.
         if (estate->query != NULL) {
@@ -707,7 +668,7 @@ wdbEndForeignScan(ForeignScanState *node) {
                 //wg_free_query_param(estate->db, estate->arglist[i].value);
             }
         }
-
+        
         if(estate->db){
             ReleaseDatabase(estate->db);
             estate->db = NULL;

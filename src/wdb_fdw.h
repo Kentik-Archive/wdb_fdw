@@ -68,6 +68,7 @@ typedef struct {
     wg_query* query;
     int numArgumentsInQuery;
     AttInMetadata *attinmeta;
+    wg_int lock_id;
 } wdbFdwExecState;
 
 typedef struct {
