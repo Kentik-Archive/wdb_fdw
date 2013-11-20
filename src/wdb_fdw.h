@@ -40,8 +40,8 @@
  * Describes the valid options for objects that use this wrapper.
  */
 struct wdbFdwOption {
-    const char *        optname;
-    Oid			optcontext;		/* Oid of catalog in which option may appear */
+    const char*         optname;
+    Oid			optcontext;  /* Oid of catalog in which option may appear */
 };
 
 typedef struct wdbTableOptions
@@ -66,6 +66,7 @@ typedef struct {
     void* db;
     List* columnMappingList;
     wg_query* query;
+    wg_query_arg* queryArguments;
     int numArgumentsInQuery;
     AttInMetadata *attinmeta;
     wg_int lock_id;
@@ -110,6 +111,6 @@ typedef struct ColumnMapping
 // Defined elsewhere
 extern List* ColumnList(RelOptInfo *baserel);
 extern List* ApplicableOpExpressionList(RelOptInfo *baserel);
-extern wg_query *BuildWhiteDBQuery(void* db, Oid relationId, List *opExpressionList, int* num);
+extern wg_query *BuildWhiteDBQuery(void* db, Oid relationId, List *opExpressionList, int numArgs, wg_query_arg* args);
 
 #endif   /* WHITEDB_FDW_H */

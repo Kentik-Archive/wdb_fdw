@@ -4,7 +4,7 @@
  * and types. This table helps us quickly translate WhiteDB columns to
  * the corresponding PostgreSQL columns.
  */
-/** // No longer needed -- use a list instead.
+
 static HTAB *
 ColumnMappingHash(Oid foreignTableId, List *columnList) {
 
@@ -49,4 +49,51 @@ ColumnMappingHash(Oid foreignTableId, List *columnList) {
     
     return columnMappingHash;
 }
-*/
+
+/*
+ * UniqueColumnList walks over the given operator list, and extracts the column
+ * argument in each operator. The function then de-duplicates extracted columns,
+ * and returns them in a new list.
+ */
+static List *
+UniqueColumnList(List *operatorList) {
+    List *uniqueColumnList = NIL;
+    ListCell *operatorCell = NULL;
+    
+    foreach(operatorCell, operatorList) {
+        OpExpr *operator = (OpExpr *) lfirst(operatorCell);
+        List *argumentList = operator->args;
+        Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
+        
+        /* list membership is determined via column's equal() function */
+        uniqueColumnList = list_append_unique(uniqueColumnList, column);
+    }
+    
+    return uniqueColumnList;
+}
+
+
+/*
+ * ColumnOperatorList finds all expressions that correspond to the given column,
+ * and returns them in a new list.
+ */
+static List *
+ColumnOperatorList(Var *column, List *operatorList) {
+    List *columnOperatorList = NIL;
+    ListCell *operatorCell = NULL;
+    
+    foreach(operatorCell, operatorList)
+        {
+            OpExpr *operator = (OpExpr *) lfirst(operatorCell);
+            List *argumentList = operator->args;
+            
+            Var *foundColumn = (Var *) FindArgumentOfType(argumentList, T_Var);
+            if (equal(column, foundColumn))
+                {
+                    columnOperatorList = lappend(columnOperatorList, operator);
+                }
+        }
+    
+    return columnOperatorList;
+}
+

@@ -28,8 +28,6 @@
 /* Local functions forward declarations */
 static Expr * FindArgumentOfType(List *argumentList, NodeTag argumentType);
 static wg_int WhiteDBOperatorName(const char *operatorName);
-static List * UniqueColumnList(List *operatorList);
-static List * ColumnOperatorList(Var *column, List *operatorList);
 static wg_int EncodeConstantValue(void* db, Const *constant);
 
 /*
@@ -41,23 +39,21 @@ static wg_int EncodeConstantValue(void* db, Const *constant);
  */
 List *
 ApplicableOpExpressionList(RelOptInfo *baserel) {
-    List *opExpressionList = NIL;
-    List *restrictInfoList = baserel->baserestrictinfo;
-    ListCell *restrictInfoCell = NULL;
+    List*             opExpressionList = NIL;
+    List*             restrictInfoList = baserel->baserestrictinfo;
+    ListCell*         restrictInfoCell = NULL;
     
     foreach(restrictInfoCell, restrictInfoList) {
-        RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
-        Expr *expression = restrictInfo->clause;
-        NodeTag expressionType = 0;
-        
-        OpExpr *opExpression = NULL;
-        char *operatorName = NULL;
-        wg_int wdbOperatorName = 0;
-        List *argumentList = NIL;
-        Var *column = NULL;
-        Const *constant = NULL;
-        bool equalsOperator = false;
-        bool constantIsArray = false;
+        RestrictInfo*        restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
+        Expr*                expression = restrictInfo->clause;
+        NodeTag              expressionType = 0;
+        OpExpr*              opExpression = NULL;
+        char*                operatorName = NULL;
+        wg_int               wdbOperatorName = 0;
+        List*                argumentList = NIL;
+        Var*                 column = NULL;
+        Const*               constant = NULL;
+        bool                 constantIsArray = false;
         
         /* we only support operator expressions */
         expressionType = nodeTag(expression);
@@ -69,12 +65,8 @@ ApplicableOpExpressionList(RelOptInfo *baserel) {
         operatorName = get_opname(opExpression->opno);
         
         /* we only support =, <, >, <=, >=, and <> operators */
-        if (strncmp(operatorName, EQUALITY_OPERATOR_NAME, NAMEDATALEN) == 0) {
-            equalsOperator = true;
-        }
-
         wdbOperatorName = WhiteDBOperatorName(operatorName);
-        if (!equalsOperator && wdbOperatorName == 0) {
+        if (wdbOperatorName == 0) {
             continue;
         }
 
@@ -112,15 +104,12 @@ ApplicableOpExpressionList(RelOptInfo *baserel) {
  * "l_shipdate: { $gte: new Date(757382400000), $lt: new Date(788918400000) }".
  */
 wg_query *
-BuildWhiteDBQuery(void* db, Oid relationId, List* opExpressionList, int* numExp) {
+BuildWhiteDBQuery(void* db, Oid relationId, List* opExpressionList, int numExpressions, wg_query_arg* argList) {
 
     ListCell*          columnCell = NULL;
-    int                numExpressions = list_length(opExpressionList);    
-    wg_query_arg       arglist[numExpressions];
     int                i = 0;
     wg_query*          query;
 
-    *numExp = numExpressions;
     if (numExpressions == 0) {
         return NULL;
     }
@@ -140,13 +129,13 @@ BuildWhiteDBQuery(void* db, Oid relationId, List* opExpressionList, int* numExp)
         operatorName = get_opname(op->opno);
         wdbOperatorName = WhiteDBOperatorName(operatorName);
 
-        arglist[i].column = columnId - 1;
-        arglist[i].cond = wdbOperatorName;
-        arglist[i].value = EncodeConstantValue(db, constant);
+        argList[i].column = columnId - 1;
+        argList[i].cond = wdbOperatorName;
+        argList[i].value = EncodeConstantValue(db, constant);
         i++;
     }
 
-    query = wg_make_query(db, NULL, 0, arglist, numExpressions);
+    query = wg_make_query(db, NULL, 0, argList, numExpressions);
     return query;
 }
 
@@ -186,7 +175,7 @@ EncodeConstantValue(void* db, Const *constant) {
                 case FLOAT4OID:
                 {
                         float4 value = DatumGetFloat4(constantValue);
-                        data = wg_encode_query_param_double(db, (double) value);
+                        data = wg_encode_query_param_fixpoint(db, (double) value);
                         break;
                 }
                 case FLOAT8OID:
@@ -233,8 +222,8 @@ EncodeConstantValue(void* db, Const *constant) {
 static Expr *
 FindArgumentOfType(List *argumentList, NodeTag argumentType) {
     
-    Expr *foundArgument = NULL;
-    ListCell *argumentCell = NULL;
+    Expr*                    foundArgument = NULL;
+    ListCell*                argumentCell = NULL;
 
     foreach(argumentCell, argumentList) {
         Expr *argument = (Expr *) lfirst(argumentCell);
@@ -283,54 +272,6 @@ WhiteDBOperatorName(const char *operatorName) {
 }
 
 /*
- * UniqueColumnList walks over the given operator list, and extracts the column
- * argument in each operator. The function then de-duplicates extracted columns,
- * and returns them in a new list.
- */
-static List *
-UniqueColumnList(List *operatorList) {
-    List *uniqueColumnList = NIL;
-    ListCell *operatorCell = NULL;
-    
-    foreach(operatorCell, operatorList) {
-        OpExpr *operator = (OpExpr *) lfirst(operatorCell);
-        List *argumentList = operator->args;
-        Var *column = (Var *) FindArgumentOfType(argumentList, T_Var);
-        
-        /* list membership is determined via column's equal() function */
-        uniqueColumnList = list_append_unique(uniqueColumnList, column);
-    }
-    
-    return uniqueColumnList;
-}
-
-
-/*
- * ColumnOperatorList finds all expressions that correspond to the given column,
- * and returns them in a new list.
- */
-static List *
-ColumnOperatorList(Var *column, List *operatorList) {
-    List *columnOperatorList = NIL;
-    ListCell *operatorCell = NULL;
-    
-    foreach(operatorCell, operatorList)
-        {
-            OpExpr *operator = (OpExpr *) lfirst(operatorCell);
-            List *argumentList = operator->args;
-            
-            Var *foundColumn = (Var *) FindArgumentOfType(argumentList, T_Var);
-            if (equal(column, foundColumn))
-                {
-                    columnOperatorList = lappend(columnOperatorList, operator);
-                }
-        }
-    
-    return columnOperatorList;
-}
-
-
-/*
  * ColumnList takes in the planner's information about this foreign table. The
  * function then finds all columns needed for query execution, including those
  * used in projections, joins, and filter clauses, de-duplicates these columns,
@@ -338,22 +279,22 @@ ColumnOperatorList(Var *column, List *operatorList) {
  */
 List *
 ColumnList(RelOptInfo *baserel) {
-    List *columnList = NIL;
-    List *neededColumnList = NIL;
-    AttrNumber columnIndex = 1;
-    AttrNumber columnCount = baserel->max_attr;
-    List *targetColumnList = baserel->reltargetlist;
-    List *restrictInfoList = baserel->baserestrictinfo;
-    ListCell *restrictInfoCell = NULL;
+    List*              columnList = NIL;
+    List*              neededColumnList = NIL;
+    AttrNumber         columnIndex = 1;
+    AttrNumber         columnCount = baserel->max_attr;
+    List*              targetColumnList = baserel->reltargetlist;
+    List*              restrictInfoList = baserel->baserestrictinfo;
+    ListCell*          restrictInfoCell = NULL;
     
     /* first add the columns used in joins and projections */
     neededColumnList = list_copy(targetColumnList);
     
     /* then walk over all restriction clauses, and pull up any used columns */
     foreach(restrictInfoCell, restrictInfoList) {
-        RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
-        Node *restrictClause = (Node *) restrictInfo->clause;
-        List *clauseColumnList = NIL;
+        RestrictInfo*          restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
+        Node*                  restrictClause = (Node *) restrictInfo->clause;
+        List*                  clauseColumnList = NIL;
         
         /* recursively pull up any columns used in the restriction clause */
         clauseColumnList = pull_var_clause(restrictClause,
@@ -365,8 +306,8 @@ ColumnList(RelOptInfo *baserel) {
     
     /* walk over all column definitions, and de-duplicate column list */
     for (columnIndex = 1; columnIndex <= columnCount; columnIndex++) {
-        ListCell *neededColumnCell = NULL;
-        Var *column = NULL;
+        ListCell*          neededColumnCell = NULL;
+        Var*               column = NULL;
         
         /* look for this column in the needed column list */
         foreach(neededColumnCell, neededColumnList) {

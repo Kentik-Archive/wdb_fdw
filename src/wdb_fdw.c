@@ -241,8 +241,8 @@ getTableOptions(Oid foreigntableid, struct wdbTableOptions *table_options) {
     ForeignTable*       table;
     ForeignServer*      server;
     UserMapping*        mapping;
-    List*               options;
-    ListCell*           lc;
+    List*               options = NIL;
+    ListCell*           lc = NULL;
 
 #ifdef DEBUG
     elog(NOTICE, "getTableOptions");
@@ -520,6 +520,7 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
     wdbFdwExecState*             estate;
     List*                        columnMappingList = NIL;
     List*                        foreignPrivateList = NIL;
+    List*                        opExpressionList = NIL;
     Oid                          foreignTableId = InvalidOid;
     ForeignScan*                 foreignScan = NULL;
 
@@ -529,6 +530,7 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
     estate->record = NULL;
     estate->db = NULL;
     estate->query = NULL;
+    estate->queryArguments = NULL;
     estate->numArgumentsInQuery = 0;
     estate->lock_id = 0;
     node->fdw_state = (void *) estate;
@@ -562,7 +564,12 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
     estate->columnMappingList = columnMappingList;
 
     // Anything to query here?
-    estate->query = BuildWhiteDBQuery(estate->db, foreignTableId, (List *)lsecond(foreignPrivateList), &estate->numArgumentsInQuery);
+    opExpressionList = (List *)lsecond(foreignPrivateList);
+    estate->numArgumentsInQuery = list_length(opExpressionList);
+    if (estate->numArgumentsInQuery > 0) {
+        estate->queryArguments = (wg_query_arg*) palloc0(sizeof(wg_query_arg) * estate->numArgumentsInQuery);
+        estate->query = BuildWhiteDBQuery(estate->db, foreignTableId, opExpressionList, estate->numArgumentsInQuery, estate->queryArguments);
+    }
 }
 
 // @TODO -- push down where clause to construct a query to run on.
@@ -660,12 +667,10 @@ wdbEndForeignScan(ForeignScanState *node) {
         wg_end_read(estate->db, estate->lock_id);
 
         // Free any query structures we have.
-        // @TODO -- figure out a way to free all the args we encoded as well.
         if (estate->query != NULL) {
-            elog(NOTICE,"FREEING QUERY %d", estate->numArgumentsInQuery);
             wg_free_query(estate->db, estate->query);
             for (int i=0; i<estate->numArgumentsInQuery; i++) {
-                //wg_free_query_param(estate->db, estate->arglist[i].value);
+                wg_free_query_param(estate->db, estate->queryArguments[i].value);
             }
         }
         
@@ -738,7 +743,7 @@ static List *
 ColumnMappingList(Oid foreignTableId, List *columnList) {
 
     ListCell *columnCell = NULL;
-    List *columnMappingList = NULL;
+    List *columnMappingList = NIL;
         
     foreach(columnCell, columnList) {
         Var *column = (Var *) lfirst(columnCell);
