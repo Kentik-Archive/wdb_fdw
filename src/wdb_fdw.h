@@ -64,10 +64,9 @@ typedef struct {
     wdbFdwPlanState plan;
     void* record;
     void* db;
-    List *columnMappingList;
-    bool key_based_qual;
-    char *key_based_qual_value;
-    bool key_based_qual_sent;
+    List* columnMappingList;
+    wg_query* query;
+    int numArgumentsInQuery;
     AttInMetadata *attinmeta;
 } wdbFdwExecState;
 
@@ -76,8 +75,7 @@ typedef struct {
     void* db;
     void* record;
     Relation rel;
-    FmgrInfo *key_info;
-    FmgrInfo *value_info;
+    List *infoList;
     AttrNumber key_junk_no;
 } wdbFdwModifyState;
 
@@ -109,6 +107,8 @@ typedef struct ColumnMapping
 } ColumnMapping;
 
 // Defined elsewhere
-extern List * ColumnList(RelOptInfo *baserel);
+extern List* ColumnList(RelOptInfo *baserel);
+extern List* ApplicableOpExpressionList(RelOptInfo *baserel);
+extern wg_query *BuildWhiteDBQuery(void* db, Oid relationId, List *opExpressionList, int* num);
 
 #endif   /* WHITEDB_FDW_H */

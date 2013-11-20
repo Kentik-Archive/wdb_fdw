@@ -106,46 +106,7 @@ static void wdbReScanForeignScan(ForeignScanState *node);
 
 static void wdbEndForeignScan(ForeignScanState *node);
 
-static void wdbAddForeignUpdateTargets(Query *parsetree,
-        RangeTblEntry *target_rte,
-        Relation target_relation);
-
-static List *wdbPlanForeignModify(PlannerInfo *root,
-        ModifyTable *plan,
-        Index resultRelation,
-        int subplan_index);
-
-static void wdbBeginForeignModify(ModifyTableState *mtstate,
-        ResultRelInfo *rinfo,
-        List *fdw_private,
-        int subplan_index,
-        int eflags);
-
-static TupleTableSlot *wdbExecForeignInsert(EState *estate,
-        ResultRelInfo *rinfo,
-        TupleTableSlot *slot,
-        TupleTableSlot *planSlot);
-
-static TupleTableSlot *wdbExecForeignUpdate(EState *estate,
-        ResultRelInfo *rinfo,
-        TupleTableSlot *slot,
-        TupleTableSlot *planSlot);
-
-static TupleTableSlot *wdbExecForeignDelete(EState *estate,
-        ResultRelInfo *rinfo,
-        TupleTableSlot *slot,
-        TupleTableSlot *planSlot);
-
-static void wdbEndForeignModify(EState *estate,
-        ResultRelInfo *rinfo);
-
 static void wdbExplainForeignScan(ForeignScanState *node,
-        struct ExplainState *es);
-
-static void wdbExplainForeignModify(ModifyTableState *mtstate,
-        ResultRelInfo *rinfo,
-        List *fdw_private,
-        int subplan_index,
         struct ExplainState *es);
 
 static bool wdbAnalyzeForeignTable(Relation relation,
@@ -159,7 +120,6 @@ void* GetDatabase(struct wdbTableOptions *table_options);
 void ReleaseDatabase(void *db);
 
 // Quick and dirty calls to populate a tuple.
-//static HTAB *ColumnMappingHash(Oid foreignTableId, List *columnList);
 static List *ColumnMappingList(Oid foreignTableId, List *columnList);
 static Datum ColumnValue(void *db, wg_int data, Oid columnTypeId, int32 columnTypeMod);
 static void FillTupleSlot(void *db, void *record, List *columnMappingList, Datum *columnValues, bool *columnNulls);
@@ -185,6 +145,7 @@ wdb_fdw_handler(PG_FUNCTION_ARGS) {
 
     /* remainder are optional - use NULL if not required */
     /* support for insert / update / delete */
+    /**
     fdwroutine->AddForeignUpdateTargets = wdbAddForeignUpdateTargets;
     fdwroutine->PlanForeignModify = wdbPlanForeignModify;
     fdwroutine->BeginForeignModify = wdbBeginForeignModify;
@@ -192,10 +153,11 @@ wdb_fdw_handler(PG_FUNCTION_ARGS) {
     fdwroutine->ExecForeignUpdate = wdbExecForeignUpdate;
     fdwroutine->ExecForeignDelete = wdbExecForeignDelete;
     fdwroutine->EndForeignModify = wdbEndForeignModify;
+    */
 
     /* support for EXPLAIN */
     fdwroutine->ExplainForeignScan = wdbExplainForeignScan;
-    fdwroutine->ExplainForeignModify = wdbExplainForeignModify;
+    //fdwroutine->ExplainForeignModify = wdbExplainForeignModify;
 
     /* support for ANALYSE */
     fdwroutine->AnalyzeForeignTable = wdbAnalyzeForeignTable;
@@ -526,10 +488,11 @@ wdbGetForeignPaths(PlannerInfo *root,
 static ForeignScan *
 wdbGetForeignPlan(PlannerInfo *root,
         RelOptInfo *baserel,
-        Oid foreigntableid,
+        Oid foreignTableId,
         ForeignPath *best_path,
         List *tlist,
         List *scan_clauses) {
+    
     /*
      * Create a ForeignScan plan node from the selected foreign access path.
      * This is called at the end of query planning. The parameters are as for
@@ -542,8 +505,10 @@ wdbGetForeignPlan(PlannerInfo *root,
      *
      */
 
-    Index scan_relid = baserel->relid;
-    List *columnList = NIL;
+    Index                  scan_relid = baserel->relid;
+    List*                  columnList = NIL;
+    List*                  opExpressionList = NIL;
+    List*                  foreignPrivateList = NIL;
 
     /*
      * We have no native ability to evaluate restriction clauses, so we just
@@ -555,15 +520,28 @@ wdbGetForeignPlan(PlannerInfo *root,
 
     elog(DEBUG1,"entering function %s",__func__);
 
+    /*
+     * We push down applicable restriction clauses to WhiteDB, but for simplicity
+     * we currently put all the restrictionClauses into the plan node's qual
+     * list for the executor to re-check. So all we have to do here is strip
+     * RestrictInfo nodes from the clauses and ignore pseudoconstants (which
+     * will be handled elsewhere).
+     */
     scan_clauses = extract_actual_clauses(scan_clauses, false);
+
+    // Pull out some needed info.
     columnList = ColumnList(baserel);
+    opExpressionList = ApplicableOpExpressionList(baserel);
+
+    // We will save this for execution later.
+    foreignPrivateList = list_make2(columnList, opExpressionList);
 
     /* Create the ForeignScan node */
     return make_foreignscan(tlist,
             scan_clauses,
             scan_relid,
             NIL, /* no expressions to evaluate */
-            columnList); 
+            foreignPrivateList); 
 }
 
 
@@ -589,22 +567,26 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
      *
      */
 
-    wdbFdwExecState *estate;
-    List *columnMappingList = NULL;
-    Oid foreignTableId = InvalidOid;
-    ForeignScan *foreignScan = NULL;
+    wdbFdwExecState*             estate;
+    List*                        columnMappingList = NIL;
+    List*                        foreignPrivateList = NIL;
+    Oid                          foreignTableId = InvalidOid;
+    ForeignScan*                 foreignScan = NULL;
 
     elog(DEBUG1,"entering function %s",__func__);
 
     estate = (wdbFdwExecState*) palloc(sizeof(wdbFdwExecState));
     estate->record = NULL;
     estate->db = NULL;
-    estate->key_based_qual = false;
-    estate->key_based_qual_sent = false;
+    estate->query = NULL;
+    estate->numArgumentsInQuery = 0;
     node->fdw_state = (void *) estate;
 
     foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
     foreignScan = (ForeignScan *) node->ss.ps.plan;
+
+    foreignPrivateList = foreignScan->fdw_private;
+    Assert(list_length(foreignPrivateList) == 2);
 
     initTableOptions(&(estate->plan.opt));
     getTableOptions(RelationGetRelid(node->ss.ss_currentRelation), &(estate->plan.opt));
@@ -618,25 +600,11 @@ wdbBeginForeignScan(ForeignScanState *node, int eflags) {
 
     estate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
 
-    columnMappingList = ColumnMappingList(foreignTableId, (List *)foreignScan->fdw_private);
-    estate->columnMappingList = columnMappingList;    
+    columnMappingList = ColumnMappingList(foreignTableId, (List *)linitial(foreignPrivateList));
+    estate->columnMappingList = columnMappingList;
 
-    /** // Skip for now.
-    if (node->ss.ps.plan->qual) {
-        ListCell   *lc;
-        
-        foreach(lc, node->ss.ps.qual){
-            ExprState  *state = lfirst(lc);
-            
-            getKeyBasedQual((Node *) state->expr, node->ss.ss_currentRelation->rd_att,
-                            &estate->key_based_qual_value, &estate->key_based_qual);
-
-            if (estate->key_based_qual) {
-                break;
-            }
-        }
-    }
-    */
+    // Anything to query here?
+    estate->query = BuildWhiteDBQuery(estate->db, foreignTableId, (List *)lsecond(foreignPrivateList), &estate->numArgumentsInQuery);
 }
 
 // @TODO -- push down where clause to construct a query to run on.
@@ -669,7 +637,6 @@ wdbIterateForeignScan(ForeignScanState *node) {
     wdbFdwExecState*        estate = (wdbFdwExecState *) node->fdw_state;
     List*                   columnMappingList = estate->columnMappingList;
     TupleTableSlot*         slot = node->ss.ss_ScanTupleSlot;
-    bool                    found = false;
     TupleDesc               tupleDescriptor = slot->tts_tupleDescriptor;
     Datum*                  columnValues = slot->tts_values;
     bool*                   columnNulls = slot->tts_isnull;
@@ -683,34 +650,18 @@ wdbIterateForeignScan(ForeignScanState *node) {
     /* initialize all values for this row to null */
     memset(columnValues, 0, columnCount * sizeof(Datum));
     memset(columnNulls, true, columnCount * sizeof(bool));
-
-    /* get the next record, if any, and fill in the slot */
-    /* Build the tuple */
-
-    /**
-    if (estate->key_based_qual) {
-        if (!estate->key_based_qual_sent) {
-            estate->key_based_qual_sent=true;
-
-            estate->record = wg_get_first_record(estate->db);
-            found = (estate->record != NULL);
-        }
-    } else {
-        estate->record = wg_get_next_record(estate->db, estate->record);
-        found = (estate->record != NULL);
-    }
-    */
-
-    if (estate->record == NULL) {
+    
+    // Pull the next record, whether we use a query or not.
+    if (estate->query != NULL) {
+        estate->record = wg_fetch(estate->db, estate->query);
+    } else if (estate->record == NULL) {
         estate->record = wg_get_first_record(estate->db);
-        found = (estate->record != NULL);
     } else {
         estate->record = wg_get_next_record(estate->db, estate->record);
-        found = (estate->record != NULL);
     }
 
-    if (found) {
-        // Transpher the record from WhiteDB state to a PG tuple.
+    if (estate->record != NULL) {
+        // Copy the record from WhiteDB state to a PG tuple.
         FillTupleSlot(estate->db, estate->record, columnMappingList, columnValues, columnNulls);
         ExecStoreVirtualTuple(slot);
     }
@@ -746,6 +697,17 @@ wdbEndForeignScan(ForeignScanState *node) {
     elog(DEBUG1,"entering function %s",__func__);
 
     if(estate) {
+        
+        // Free any query structures we have.
+        // @TODO -- figure out a way to free all the args we encoded as well.
+        if (estate->query != NULL) {
+            elog(NOTICE,"FREEING QUERY %d", estate->numArgumentsInQuery);
+            wg_free_query(estate->db, estate->query);
+            for (int i=0; i<estate->numArgumentsInQuery; i++) {
+                //wg_free_query_param(estate->db, estate->arglist[i].value);
+            }
+        }
+
         if(estate->db){
             ReleaseDatabase(estate->db);
             estate->db = NULL;
@@ -753,427 +715,8 @@ wdbEndForeignScan(ForeignScanState *node) {
     }
 }
 
-
-static void
-wdbAddForeignUpdateTargets(Query *parsetree,
-        RangeTblEntry *target_rte,
-        Relation target_relation) {
-    /*
-     * UPDATE and DELETE operations are performed against rows previously
-     * fetched by the table-scanning functions. The FDW may need extra
-     * information, such as a row ID or the values of primary-key columns, to
-     * ensure that it can identify the exact row to update or delete. To
-     * support that, this function can add extra hidden, or "junk", target
-     * columns to the list of columns that are to be retrieved from the
-     * foreign table during an UPDATE or DELETE.
-     *
-     * To do that, add TargetEntry items to parsetree->targetList, containing
-     * expressions for the extra values to be fetched. Each such entry must be
-     * marked resjunk = true, and must have a distinct resname that will
-     * identify it at execution time. Avoid using names matching ctidN or
-     * wholerowN, as the core system can generate junk columns of these names.
-     *
-     * This function is called in the rewriter, not the planner, so the
-     * information available is a bit different from that available to the
-     * planning routines. parsetree is the parse tree for the UPDATE or DELETE
-     * command, while target_rte and target_relation describe the target
-     * foreign table.
-     *
-     * If the AddForeignUpdateTargets pointer is set to NULL, no extra target
-     * expressions are added. (This will make it impossible to implement
-     * DELETE operations, though UPDATE may still be feasible if the FDW
-     * relies on an unchanging primary key to identify rows.)
-     */
-
-    Form_pg_attribute attr;
-    Var *varnode;
-    const char *attrname;
-    TargetEntry * tle;
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    attr = RelationGetDescr(target_relation)->attrs[0];
-
-    varnode = makeVar(parsetree->resultRelation,
-            attr->attnum,
-            attr->atttypid, attr->atttypmod,
-            attr->attcollation,
-            0);
-
-    /* Wrap it in a resjunk TLE with the right name ... */
-    attrname = "key_junk";
-    tle = makeTargetEntry((Expr *) varnode,
-            list_length(parsetree->targetList) + 1,
-            pstrdup(attrname),true);
-
-    /* ... and add it to the query's targetlist */
-    parsetree->targetList = lappend(parsetree->targetList, tle);
-}
-
-
-static List * 
-wdbPlanForeignModify(PlannerInfo *root,
-        ModifyTable *plan,
-        Index resultRelation,
-        int subplan_index) {
-
-    /*
-     * Perform any additional planning actions needed for an insert, update,
-     * or delete on a foreign table. This function generates the FDW-private
-     * information that will be attached to the ModifyTable plan node that
-     * performs the update action. This private information must have the form
-     * of a List, and will be delivered to BeginForeignModify during the
-     * execution stage.
-     *
-     * root is the planner's global information about the query. plan is the
-     * ModifyTable plan node, which is complete except for the fdwPrivLists
-     * field. resultRelation identifies the target foreign table by its
-     * rangetable index. subplan_index identifies which target of the
-     * ModifyTable plan node this is, counting from zero; use this if you want
-     * to index into plan->plans or other substructure of the plan node.
-     *
-     * If the PlanForeignModify pointer is set to NULL, no additional
-     * plan-time actions are taken, and the fdw_private list delivered to
-     * BeginForeignModify will be NIL.
-     */
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    return NULL;
-}
-
-
-static void
-wdbBeginForeignModify(ModifyTableState *mtstate,
-        ResultRelInfo *rinfo,
-        List *fdw_private,
-        int subplan_index,
-        int eflags) {
-
-    /*
-     * Begin executing a foreign table modification operation. This routine is
-     * called during executor startup. It should perform any initialization
-     * needed prior to the actual table modifications. Subsequently,
-     * ExecForeignInsert, ExecForeignUpdate or ExecForeignDelete will be
-     * called for each tuple to be inserted, updated, or deleted.
-     *
-     * mtstate is the overall state of the ModifyTable plan node being
-     * executed; global data about the plan and execution state is available
-     * via this structure. rinfo is the ResultRelInfo struct describing the
-     * target foreign table. (The ri_FdwState field of ResultRelInfo is
-     * available for the FDW to store any private state it needs for this
-     * operation.) fdw_private contains the private data generated by
-     * PlanForeignModify, if any. subplan_index identifies which target of the
-     * ModifyTable plan node this is. eflags contains flag bits describing the
-     * executor's operating mode for this plan node.
-     *
-     * Note that when (eflags & EXEC_FLAG_EXPLAIN_ONLY) is true, this function
-     * should not perform any externally-visible actions; it should only do
-     * the minimum required to make the node state valid for
-     * ExplainForeignModify and EndForeignModify.
-     *
-     * If the BeginForeignModify pointer is set to NULL, no action is taken
-     * during executor startup.
-     */
-    Relation    rel = rinfo->ri_RelationDesc;
-    wdbFdwModifyState *fmstate;
-    Form_pg_attribute attr;
-    Oid typefnoid;
-    bool isvarlena;
-    CmdType operation = mtstate->operation;
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
-        return;
-
-    fmstate = (wdbFdwModifyState *) palloc0(sizeof(wdbFdwModifyState));
-    fmstate->rel = rel;
-    fmstate->key_info = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-    fmstate->value_info = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-
-
-    if (operation == CMD_UPDATE || operation == CMD_DELETE) {
-        /* Find the ctid resjunk column in the subplan's result */
-        Plan       *subplan = mtstate->mt_plans[subplan_index]->plan;
-        fmstate->key_junk_no = ExecFindJunkAttributeInTlist(subplan->targetlist,
-                                                            "key_junk");
-        if (!AttributeNumberIsValid(fmstate->key_junk_no))
-            elog(ERROR, "could not find key junk column");
-    }
-
-    attr = RelationGetDescr(rel)->attrs[0];
-    Assert(!attr->attisdropped);
-    getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
-    fmgr_info(typefnoid, fmstate->key_info);
-
-    attr = RelationGetDescr(rel)->attrs[1];
-    Assert(!attr->attisdropped);
-    getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
-    fmgr_info(typefnoid, fmstate->value_info);
-
-    initTableOptions(&(fmstate->opt));
-    getTableOptions(RelationGetRelid(rel), &(fmstate->opt));
-
-    fmstate->db = GetDatabase(&(fmstate->opt));
-    fmstate->record = NULL;
-
-    rinfo->ri_FdwState=fmstate;
-}
-
-
-static TupleTableSlot *
-wdbExecForeignInsert(EState *estate,
-                     ResultRelInfo *rinfo,
-                     TupleTableSlot *slot,
-                     TupleTableSlot *planSlot) {
-    /*
-     * Insert one tuple into the foreign table. estate is global execution
-     * state for the query. rinfo is the ResultRelInfo struct describing the
-     * target foreign table. slot contains the tuple to be inserted; it will
-     * match the rowtype definition of the foreign table. planSlot contains
-     * the tuple that was generated by the ModifyTable plan node's subplan; it
-     * differs from slot in possibly containing additional "junk" columns.
-     * (The planSlot is typically of little interest for INSERT cases, but is
-     * provided for completeness.)
-     *
-     * The return value is either a slot containing the data that was actually
-     * inserted (this might differ from the data supplied, for example as a
-     * result of trigger actions), or NULL if no row was actually inserted
-     * (again, typically as a result of triggers). The passed-in slot can be
-     * re-used for this purpose.
-     *
-     * The data in the returned slot is used only if the INSERT query has a
-     * RETURNING clause. Hence, the FDW could choose to optimize away
-     * returning some or all columns depending on the contents of the
-     * RETURNING clause. However, some slot must be returned to indicate
-     * success, or the query's reported rowcount will be wrong.
-     *
-     * If the ExecForeignInsert pointer is set to NULL, attempts to insert
-     * into the foreign table will fail with an error message.
-     *
-     */
-
-    char * key_value;
-    char * value_value;
-    Datum value;
-    bool isnull;
-    wdbFdwModifyState *fmstate = (wdbFdwModifyState *) rinfo->ri_FdwState;
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    value = slot_getattr(planSlot, 1, &isnull);
-    if(isnull)
-        elog(ERROR, "can't get key value");
-    key_value = OutputFunctionCall(fmstate->key_info, value);
-
-    value = slot_getattr(planSlot, 2, &isnull);
-    if(isnull)
-        elog(ERROR, "can't get value value");
-    value_value = OutputFunctionCall(fmstate->value_info, value);
-
-    fmstate->record = wg_create_record(fmstate->db, MAX_RECORD_FIELDS);
-    if (fmstate->record != NULL) {
-        if (wg_set_str_field(fmstate->db, fmstate->record, 0, key_value) != 0) {
-            elog(ERROR, "Error from wdb: %s", "Could not update record key");
-        }
-        if (wg_set_str_field(fmstate->db, fmstate->record, 1, value_value) != 0) {
-            elog(ERROR, "Error from wdb: %s", "Could not update record value");
-        }
-    } else {
-        elog(ERROR, "Could not insert into database");
-    }
-
-    return slot;
-}
-
-
-static TupleTableSlot *
-wdbExecForeignUpdate(EState *estate,
-        ResultRelInfo *rinfo,
-        TupleTableSlot *slot,
-        TupleTableSlot *planSlot) {
-
-    /*
-     * Update one tuple in the foreign table. estate is global execution state
-     * for the query. rinfo is the ResultRelInfo struct describing the target
-     * foreign table. slot contains the new data for the tuple; it will match
-     * the rowtype definition of the foreign table. planSlot contains the
-     * tuple that was generated by the ModifyTable plan node's subplan; it
-     * differs from slot in possibly containing additional "junk" columns. In
-     * particular, any junk columns that were requested by
-     * AddForeignUpdateTargets will be available from this slot.
-     *
-     * The return value is either a slot containing the row as it was actually
-     * updated (this might differ from the data supplied, for example as a
-     * result of trigger actions), or NULL if no row was actually updated
-     * (again, typically as a result of triggers). The passed-in slot can be
-     * re-used for this purpose.
-     *
-     * The data in the returned slot is used only if the UPDATE query has a
-     * RETURNING clause. Hence, the FDW could choose to optimize away
-     * returning some or all columns depending on the contents of the
-     * RETURNING clause. However, some slot must be returned to indicate
-     * success, or the query's reported rowcount will be wrong.
-     *
-     * If the ExecForeignUpdate pointer is set to NULL, attempts to update the
-     * foreign table will fail with an error message.
-     *
-     */
-    char * key_value;
-    char * key_value_new;
-    char * value_value;
-    Datum value;
-    bool isnull;
-    char** values;
-    wdbFdwModifyState *fmstate = (wdbFdwModifyState *) rinfo->ri_FdwState;
-    wg_int      i = 0;
-    HeapTuple	tuple;
-    wg_int numFields;
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    value = ExecGetJunkAttribute(planSlot, fmstate->key_junk_no, &isnull);
-    if(isnull)
-        elog(ERROR, "can't get junk key value");
-    key_value = OutputFunctionCall(fmstate->key_info, value);
-
-    value = slot_getattr(planSlot, 1, &isnull);
-    if(isnull)
-        elog(ERROR, "can't get new key value");
-    key_value_new = OutputFunctionCall(fmstate->key_info, value);
-
-    if(strcmp(key_value, key_value_new) != 0) {
-        elog(ERROR, "You cannot update key values (original key value was %s)", key_value);
-        return slot;
-    }
-
-    value = slot_getattr(planSlot, 2, &isnull);
-    if(isnull) {
-        elog(ERROR, "can't get value value");
-    }
-
-    value_value = OutputFunctionCall(fmstate->value_info, value);
-    fmstate->record = wg_find_record_str(fmstate->db, 0, WG_COND_EQUAL, key_value, fmstate->record);
-    if (fmstate->record != NULL) {
-        if (wg_set_str_field(fmstate->db, fmstate->record, 1, value_value) != 0) {
-            elog(ERROR, "Error from wdb: %s", "Could not update record");
-        } else {
-            numFields = wg_get_record_len(fmstate->db, fmstate->record);
-            values = (char **) palloc(sizeof(char *) *numFields);
-            
-            for (i=0; i<numFields; i++) {
-                values[i] = wg_decode_str(fmstate->db, wg_get_field(fmstate->db, fmstate->record, i));
-            }
-            
-            tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(fmstate->rel->rd_att), values);
-            ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-        }
-    } else {
-        elog(ERROR, "Could not insert into database");
-    }
-    
-    return slot;
-}
-
-
-static TupleTableSlot *
-wdbExecForeignDelete(EState *estate,
-        ResultRelInfo *rinfo,
-        TupleTableSlot *slot,
-        TupleTableSlot *planSlot) {
-
-    /*
-     * Delete one tuple from the foreign table. estate is global execution
-     * state for the query. rinfo is the ResultRelInfo struct describing the
-     * target foreign table. slot contains nothing useful upon call, but can
-     * be used to hold the returned tuple. planSlot contains the tuple that
-     * was generated by the ModifyTable plan node's subplan; in particular, it
-     * will carry any junk columns that were requested by
-     * AddForeignUpdateTargets. The junk column(s) must be used to identify
-     * the tuple to be deleted.
-     *
-     * The return value is either a slot containing the row that was deleted,
-     * or NULL if no row was deleted (typically as a result of triggers). The
-     * passed-in slot can be used to hold the tuple to be returned.
-     *
-     * The data in the returned slot is used only if the DELETE query has a
-     * RETURNING clause. Hence, the FDW could choose to optimize away
-     * returning some or all columns depending on the contents of the
-     * RETURNING clause. However, some slot must be returned to indicate
-     * success, or the query's reported rowcount will be wrong.
-     *
-     * If the ExecForeignDelete pointer is set to NULL, attempts to delete
-     * from the foreign table will fail with an error message.
-     */
-
-    char * key_value;
-    Datum value;
-    bool isnull;
-    char** values;
-    wdbFdwModifyState *fmstate = (wdbFdwModifyState *) rinfo->ri_FdwState;
-    wg_int      i = 0;
-    HeapTuple	tuple;
-    wg_int numFields;
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    value = ExecGetJunkAttribute(planSlot, fmstate->key_junk_no, &isnull);
-    if(isnull)
-        elog(ERROR, "can't get key value");
-
-    key_value = OutputFunctionCall(fmstate->key_info, value);
-
-    fmstate->record = wg_find_record_str(fmstate->db, 0, WG_COND_EQUAL, key_value, NULL);
-    if (fmstate->record != NULL) {
-
-        numFields = wg_get_record_len(fmstate->db, fmstate->record);
-        values = (char **) palloc(sizeof(char *) *numFields);
-            
-        for (i=0; i<numFields; i++) {
-            values[i] = wg_decode_str(fmstate->db, wg_get_field(fmstate->db, fmstate->record, i));
-        }
-            
-        tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(fmstate->rel->rd_att), values);
-        ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-        elog(NOTICE, "DELETED %s", key_value);
-        
-        if (wg_delete_record(fmstate->db, fmstate->record) != 0) {
-            elog(ERROR, "Error from wdb: %s", "Could not delete record");
-        }
-    } else {
-        elog(NOTICE, "NO VAL %s", key_value);
-    }
-
-    return slot;
-}
-
-
-static void
-wdbEndForeignModify(EState *estate,
-        ResultRelInfo *rinfo) {
-    /*
-     * End the table update and release resources. It is normally not
-     * important to release palloc'd memory, but for example open files and
-     * connections to remote servers should be cleaned up.
-     *
-     * If the EndForeignModify pointer is set to NULL, no action is taken
-     * during executor shutdown.
-     */
-
-    wdbFdwModifyState *fmstate = (wdbFdwModifyState *) rinfo->ri_FdwState;
-
-    elog(DEBUG1,"entering function %s",__func__);
-
-    if(fmstate) {
-        if(fmstate->db) {
-            ReleaseDatabase(fmstate->db);
-            fmstate->db = NULL;
-        }
-    }
-}
-
+///// Now getting into the INSERT / UPDATE / DELETE parts.
+// @TODO -- taken out for now.
 
 static void
 wdbExplainForeignScan(ForeignScanState *node,
@@ -1192,29 +735,6 @@ wdbExplainForeignScan(ForeignScanState *node,
     elog(DEBUG1,"entering function %s",__func__);
 
 }
-
-
-static void
-wdbExplainForeignModify(ModifyTableState *mtstate,
-        ResultRelInfo *rinfo,
-        List *fdw_private,
-        int subplan_index,
-        struct ExplainState *es) {
-    /*
-     * Print additional EXPLAIN output for a foreign table update. This
-     * function can call ExplainPropertyText and related functions to add
-     * fields to the EXPLAIN output. The flag fields in es can be used to
-     * determine what to print, and the state of the ModifyTableState node can
-     * be inspected to provide run-time statistics in the EXPLAIN ANALYZE
-     * case. The first four arguments are the same as for BeginForeignModify.
-     *
-     * If the ExplainForeignModify pointer is set to NULL, no additional
-     * information is printed during EXPLAIN.
-     */
-
-    elog(DEBUG1,"entering function %s",__func__);
-}
-
 
 static bool
 wdbAnalyzeForeignTable(Relation relation,
@@ -1283,58 +803,6 @@ ColumnMappingList(Oid foreignTableId, List *columnList) {
     
     return columnMappingList;
 }
-
-/*
- * ColumnMappingHash creates a hash table that maps column names to column index
- * and types. This table helps us quickly translate WhiteDB columns to
- * the corresponding PostgreSQL columns.
- */
-/** // No longer needed -- use a list instead.
-static HTAB *
-ColumnMappingHash(Oid foreignTableId, List *columnList) {
-
-    ListCell *columnCell = NULL;
-    const long hashTableSize = 2048;
-    HTAB *columnMappingHash = NULL;
-    
-    HASHCTL hashInfo;
-    memset(&hashInfo, 0, sizeof(hashInfo));
-    hashInfo.keysize = NAMEDATALEN;
-    hashInfo.entrysize = sizeof(ColumnMapping);
-    hashInfo.hash = string_hash;
-    hashInfo.hcxt = CurrentMemoryContext;
-    
-    columnMappingHash = hash_create("Column Mapping Hash", hashTableSize, &hashInfo,
-                                    (HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT));
-    Assert(columnMappingHash != NULL);
-    
-    foreach(columnCell, columnList) {
-        Var *column = (Var *) lfirst(columnCell);
-        AttrNumber columnId = column->varattno;
-        
-        ColumnMapping *columnMapping = NULL;
-        char *columnName = NULL;
-        bool handleFound = false;
-        void *hashKey = NULL;
-        
-        columnName = get_relid_attribute_name(foreignTableId, columnId);
-        hashKey = (void *) columnName;
-        
-        columnMapping = (ColumnMapping *) hash_search(columnMappingHash, hashKey,
-                                                      HASH_ENTER, &handleFound);
-        Assert(columnMapping != NULL);
-        
-        columnMapping->columnIndex = columnId - 1;
-        columnMapping->columnTypeId = column->vartype;
-        columnMapping->columnTypeMod = column->vartypmod;
-        columnMapping->columnArrayTypeId = get_element_type(column->vartype);
-
-        elog(NOTICE, "Column %s %d", columnName, columnId);
-    }
-    
-    return columnMappingHash;
-}
-*/
 
 /**
    Given a WhiteDB record, translates it to a PG Tuple.
