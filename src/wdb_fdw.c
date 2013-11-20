@@ -15,7 +15,7 @@
  */
 
 #include "postgres.h"
-#include <whitedb/dbapi.h>
+#include "wdb_fdw.h"
 
 #include "access/reloptions.h"
 #include "foreign/fdwapi.h"
@@ -60,7 +60,7 @@ PG_MODULE_MAGIC;
 
 //taken from redis_fdw
 #define PROCID_TEXTEQ 67
-#define DEBUG 1
+//#define DEBUG 1
 #define MAX_RECORD_FIELDS 2
 
 /*
@@ -72,6 +72,14 @@ extern Datum wdb_fdw_validator(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(wdb_fdw_handler);
 PG_FUNCTION_INFO_V1(wdb_fdw_validator);
 
+static struct wdbFdwOption valid_options[] =
+{
+    /* Connection options */
+    {"address", ForeignServerRelationId},
+    {"size", ForeignServerRelationId},
+    /* Sentinel */
+    {NULL, InvalidOid}
+};
 
 /* callback functions */
 static void wdbGetForeignRelSize(PlannerInfo *root,
@@ -144,90 +152,22 @@ static bool wdbAnalyzeForeignTable(Relation relation,
         AcquireSampleRowsFunc *func,
         BlockNumber *totalpages);
 
-
-
-/*
- * structures used by the FDW
- *
- * These next two are not actualkly used by wdb, but something like this
- * will be needed by anything more complicated that does actual work.
- *
- */
-
-/*
- * Describes the valid options for objects that use this wrapper.
- */
-struct wdbFdwOption {
-    const char *        optname;
-    Oid			optcontext;		/* Oid of catalog in which option may appear */
-};
-
-static struct wdbFdwOption valid_options[] =
-{
-/* Connection options */
-    {"address", ForeignServerRelationId},
-    {"size", ForeignServerRelationId},
-    /* Sentinel */
-    {NULL, InvalidOid}
-};
-
-
-typedef struct wdbTableOptions
-{
-    char *address;
-    int32_t size;
-    Oid serverId;
-    Oid userId;
-} wdbTableOptions;
-/*
- * This is what will be set and stashed away in fdw_private and fetched
- * for subsequent routines.
- */
-typedef struct
-{
-    wdbTableOptions opt;
-} wdbFdwPlanState;
-
-typedef struct {
-    wdbFdwPlanState plan;
-    void* record;
-    void* db;
-    bool key_based_qual;
-    char *key_based_qual_value;
-    bool key_based_qual_sent;
-    AttInMetadata *attinmeta;
-} wdbFdwExecState;
-
-typedef struct {
-    wdbTableOptions opt;
-    void* db;
-    void* record;
-    Relation rel;
-    FmgrInfo *key_info;
-    FmgrInfo *value_info;
-    AttrNumber key_junk_no;
-} wdbFdwModifyState;
-
-typedef struct {
-    Oid serverId;
-    Oid userId;
-} wdbConnCacheKey;
-
-typedef struct {
-  wdbConnCacheKey key;
-  void* db;
-  int xact_depth;
-} wdbConnCacheEntry;
-
 static HTAB *ConnectionHash = NULL;
 
 void initTableOptions(struct wdbTableOptions *table_options);
 void* GetDatabase(struct wdbTableOptions *table_options);
 void ReleaseDatabase(void *db);
 
+// Quick and dirty calls to populate a tuple.
+//static HTAB *ColumnMappingHash(Oid foreignTableId, List *columnList);
+static List *ColumnMappingList(Oid foreignTableId, List *columnList);
+static Datum ColumnValue(void *db, wg_int data, Oid columnTypeId, int32 columnTypeMod);
+static void FillTupleSlot(void *db, void *record, List *columnMappingList, Datum *columnValues, bool *columnNulls);
+static bool ColumnTypesCompatible(wg_int wgType, Oid columnTypeId);
+
 Datum
-wdb_fdw_handler(PG_FUNCTION_ARGS)
-{
+wdb_fdw_handler(PG_FUNCTION_ARGS) {
+
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
     elog(DEBUG1,"entering function %s",__func__);
@@ -263,8 +203,8 @@ wdb_fdw_handler(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(fdwroutine);
 }
 
-static bool isValidOption(const char *option, Oid context)
-{
+static bool isValidOption(const char *option, Oid context) {
+
     struct wdbFdwOption *opt;
     
 #ifdef DEBUG
@@ -324,23 +264,18 @@ void * GetDatabase(struct wdbTableOptions *table_options) {
     return entry->db;
  }
 
-void ReleaseDatabase(void *db)
-{
+void ReleaseDatabase(void *db) {
     /* keep arround for next connection */
-    /*
-      wg_detach_database(db);
-    */
+    // wg_detach_database(db);
 }
 
-void initTableOptions(struct wdbTableOptions *table_options)
-{
+void initTableOptions(struct wdbTableOptions *table_options) {
     table_options->address = NULL;
     table_options->size = 0;
 }
 
 static void
-getTableOptions(Oid foreigntableid, struct wdbTableOptions *table_options)
-{
+getTableOptions(Oid foreigntableid, struct wdbTableOptions *table_options) {
     ForeignTable*       table;
     ForeignServer*      server;
     UserMapping*        mapping;
@@ -381,17 +316,14 @@ getTableOptions(Oid foreigntableid, struct wdbTableOptions *table_options)
 
     /* Default values, if required */
     if (!table_options->address)
-        table_options->address = "1000";
+        table_options->address = WDB_DEFAULT_ADDRESS;
     if(!table_options->size)
-        table_options->size = 1000000; // 1MB
+        table_options->size = WDB_DEFAULT_SIZE;
 
 }
 
-
-
 Datum
-wdb_fdw_validator(PG_FUNCTION_ARGS)
-{
+wdb_fdw_validator(PG_FUNCTION_ARGS) {
     List*          options_list = untransformRelOptions(PG_GETARG_DATUM(0));
     Oid            catalog = PG_GETARG_OID(1);
     ListCell*      cell;
@@ -454,11 +386,11 @@ wdb_fdw_validator(PG_FUNCTION_ARGS)
         }
     }
 
-
     PG_RETURN_VOID();
 }
 
 // Does ???
+/**
 static void
 getKeyBasedQual(Node *node, TupleDesc tupdesc, char **value, bool *key_based_qual) {
     char *key = NULL;
@@ -486,20 +418,15 @@ getKeyBasedQual(Node *node, TupleDesc tupdesc, char **value, bool *key_based_qua
 
         right = list_nth(op->args, 1);
 
-        if (IsA(right, Const))
-        {
+        if (IsA(right, Const)) {
+
             StringInfoData buf;
 
             initStringInfo(&buf);
 
-            /* And get the column and value... */
             key = NameStr(tupdesc->attrs[varattno - 1]->attname);
             *value = TextDatumGetCString(((Const *) right)->constvalue);
 
-            /*
-             * We can push down this qual if: - The operatory is TEXTEQ - The
-             * qual is on the key column
-             */
             if (op->opfuncid == PROCID_TEXTEQ && strcmp(key, "key") == 0)
                 *key_based_qual = true;
 
@@ -509,7 +436,7 @@ getKeyBasedQual(Node *node, TupleDesc tupdesc, char **value, bool *key_based_qua
 
     return;
 }
-
+*/
 
 
 static void wdbGetForeignRelSize(PlannerInfo *root,
@@ -575,9 +502,6 @@ wdbGetForeignPaths(PlannerInfo *root,
      * that is needed to identify the specific scan method intended.
      */
 
-
-    //wdbFdwPlanState *fdw_private = baserel->fdw_private;
-
     Cost startup_cost, total_cost;
 
     elog(DEBUG1,"entering function %s",__func__);
@@ -619,6 +543,7 @@ wdbGetForeignPlan(PlannerInfo *root,
      */
 
     Index scan_relid = baserel->relid;
+    List *columnList = NIL;
 
     /*
      * We have no native ability to evaluate restriction clauses, so we just
@@ -631,19 +556,19 @@ wdbGetForeignPlan(PlannerInfo *root,
     elog(DEBUG1,"entering function %s",__func__);
 
     scan_clauses = extract_actual_clauses(scan_clauses, false);
+    columnList = ColumnList(baserel);
 
     /* Create the ForeignScan node */
     return make_foreignscan(tlist,
             scan_clauses,
             scan_relid,
             NIL, /* no expressions to evaluate */
-            NIL); /* no private state either */
+            columnList); 
 }
 
 
 static void
-wdbBeginForeignScan(ForeignScanState *node,
-        int eflags) {
+wdbBeginForeignScan(ForeignScanState *node, int eflags) {
 
     /*
      * Begin executing a foreign scan. This is called during executor startup.
@@ -664,8 +589,10 @@ wdbBeginForeignScan(ForeignScanState *node,
      *
      */
 
-
     wdbFdwExecState *estate;
+    List *columnMappingList = NULL;
+    Oid foreignTableId = InvalidOid;
+    ForeignScan *foreignScan = NULL;
 
     elog(DEBUG1,"entering function %s",__func__);
 
@@ -676,11 +603,13 @@ wdbBeginForeignScan(ForeignScanState *node,
     estate->key_based_qual_sent = false;
     node->fdw_state = (void *) estate;
 
+    foreignTableId = RelationGetRelid(node->ss.ss_currentRelation);
+    foreignScan = (ForeignScan *) node->ss.ps.plan;
+
     initTableOptions(&(estate->plan.opt));
     getTableOptions(RelationGetRelid(node->ss.ss_currentRelation), &(estate->plan.opt));
 
     /* initialize required state in fdw_private */
-
     estate->db = GetDatabase(&(estate->plan.opt));
 
     /* OK, we connected. If this is an EXPLAIN, bail out now */
@@ -688,7 +617,10 @@ wdbBeginForeignScan(ForeignScanState *node,
         return;
 
     estate->attinmeta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
-    
+
+    columnMappingList = ColumnMappingList(foreignTableId, (List *)foreignScan->fdw_private);
+    estate->columnMappingList = columnMappingList;    
+
     /** // Skip for now.
     if (node->ss.ps.plan->qual) {
         ListCell   *lc;
@@ -704,17 +636,12 @@ wdbBeginForeignScan(ForeignScanState *node,
             }
         }
     }
-    */ 
-
-    // Should I initialize to the first record?
-    //if (!estate->key_based_qual)
-    //estate->record = wg_get_first_record(estate->db);
+    */
 }
 
-
+// @TODO -- push down where clause to construct a query to run on.
 static TupleTableSlot *
-wdbIterateForeignScan(ForeignScanState *node)
-{
+wdbIterateForeignScan(ForeignScanState *node) {
     /*
      * Fetch one row from the foreign source, returning it in a tuple table
      * slot (the node's ScanTupleSlot should be used for this purpose). Return
@@ -739,17 +666,23 @@ wdbIterateForeignScan(ForeignScanState *node)
      * (just as you would need to do in the case of a data type mismatch).
      */
 
-    wdbFdwExecState *estate = (wdbFdwExecState *) node->fdw_state;
-
-    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-
-    bool found = false;
-    char** values;
-    HeapTuple tuple;
+    wdbFdwExecState*        estate = (wdbFdwExecState *) node->fdw_state;
+    List*                   columnMappingList = estate->columnMappingList;
+    TupleTableSlot*         slot = node->ss.ss_ScanTupleSlot;
+    bool                    found = false;
+    TupleDesc               tupleDescriptor = slot->tts_tupleDescriptor;
+    Datum*                  columnValues = slot->tts_values;
+    bool*                   columnNulls = slot->tts_isnull;
+    int32                   columnCount = tupleDescriptor->natts;
 
     elog(DEBUG1,"entering function %s",__func__);
 
+    // First clear this guy out.
     ExecClearTuple(slot);
+
+    /* initialize all values for this row to null */
+    memset(columnValues, 0, columnCount * sizeof(Datum));
+    memset(columnNulls, true, columnCount * sizeof(bool));
 
     /* get the next record, if any, and fill in the slot */
     /* Build the tuple */
@@ -777,18 +710,11 @@ wdbIterateForeignScan(ForeignScanState *node)
     }
 
     if (found) {
-        
-        values = (char **) palloc(sizeof(char *) *wg_get_record_len(estate->db, estate->record));
-        //if (estate->key_based_qual) {
-        //    values[0] = estate->key_based_qual_value;
-        //} else {
-        values[0] = wg_decode_str(estate->db, wg_get_field(estate->db, estate->record, 0));
-            //}
-
-        values[1] = wg_decode_str(estate->db, wg_get_field(estate->db, estate->record, 1));
-        tuple = BuildTupleFromCStrings(estate->attinmeta, values);
-        ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+        // Transpher the record from WhiteDB state to a PG tuple.
+        FillTupleSlot(estate->db, estate->record, columnMappingList, columnValues, columnNulls);
+        ExecStoreVirtualTuple(slot);
     }
+
     /* then return the slot */
     return slot;
 }
@@ -971,11 +897,10 @@ wdbBeginForeignModify(ModifyTableState *mtstate,
         /* Find the ctid resjunk column in the subplan's result */
         Plan       *subplan = mtstate->mt_plans[subplan_index]->plan;
         fmstate->key_junk_no = ExecFindJunkAttributeInTlist(subplan->targetlist,
-                "key_junk");
+                                                            "key_junk");
         if (!AttributeNumberIsValid(fmstate->key_junk_no))
             elog(ERROR, "could not find key junk column");
     }
-
 
     attr = RelationGetDescr(rel)->attrs[0];
     Assert(!attr->attisdropped);
@@ -1047,7 +972,6 @@ wdbExecForeignInsert(EState *estate,
         elog(ERROR, "can't get value value");
     value_value = OutputFunctionCall(fmstate->value_info, value);
 
-
     fmstate->record = wg_create_record(fmstate->db, MAX_RECORD_FIELDS);
     if (fmstate->record != NULL) {
         if (wg_set_str_field(fmstate->db, fmstate->record, 0, key_value) != 0) {
@@ -1056,6 +980,8 @@ wdbExecForeignInsert(EState *estate,
         if (wg_set_str_field(fmstate->db, fmstate->record, 1, value_value) != 0) {
             elog(ERROR, "Error from wdb: %s", "Could not update record value");
         }
+    } else {
+        elog(ERROR, "Could not insert into database");
     }
 
     return slot;
@@ -1142,9 +1068,9 @@ wdbExecForeignUpdate(EState *estate,
             
             tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(fmstate->rel->rd_att), values);
             ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-            elog(NOTICE, "UPDATED %s", value_value);
         }
+    } else {
+        elog(ERROR, "Could not insert into database");
     }
     
     return slot;
@@ -1322,4 +1248,275 @@ wdbAnalyzeForeignTable(Relation relation,
      */
     elog(DEBUG1,"entering function %s",__func__);
     return false;
+}
+
+
+//////// Static Helper Functions need to be here.
+
+static List *
+ColumnMappingList(Oid foreignTableId, List *columnList) {
+
+    ListCell *columnCell = NULL;
+    List *columnMappingList = NULL;
+        
+    foreach(columnCell, columnList) {
+        Var *column = (Var *) lfirst(columnCell);
+        AttrNumber columnId = column->varattno;
+        
+        ColumnMapping *columnMapping = NULL;
+        char *columnName = NULL;
+        
+        columnName = get_relid_attribute_name(foreignTableId, columnId);
+        
+        columnMapping = (ColumnMapping *)  palloc0(sizeof(ColumnMapping));
+        Assert(columnMapping != NULL);
+        
+        columnMapping->columnName = pstrdup(columnName);
+        columnMapping->columnIndex = columnId - 1;
+        columnMapping->columnTypeId = column->vartype;
+        columnMapping->columnTypeMod = column->vartypmod;
+        columnMapping->columnArrayTypeId = get_element_type(column->vartype);
+
+        // Append to our list.
+        columnMappingList = lcons(columnMapping, columnMappingList);
+    }
+    
+    return columnMappingList;
+}
+
+/*
+ * ColumnMappingHash creates a hash table that maps column names to column index
+ * and types. This table helps us quickly translate WhiteDB columns to
+ * the corresponding PostgreSQL columns.
+ */
+/** // No longer needed -- use a list instead.
+static HTAB *
+ColumnMappingHash(Oid foreignTableId, List *columnList) {
+
+    ListCell *columnCell = NULL;
+    const long hashTableSize = 2048;
+    HTAB *columnMappingHash = NULL;
+    
+    HASHCTL hashInfo;
+    memset(&hashInfo, 0, sizeof(hashInfo));
+    hashInfo.keysize = NAMEDATALEN;
+    hashInfo.entrysize = sizeof(ColumnMapping);
+    hashInfo.hash = string_hash;
+    hashInfo.hcxt = CurrentMemoryContext;
+    
+    columnMappingHash = hash_create("Column Mapping Hash", hashTableSize, &hashInfo,
+                                    (HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT));
+    Assert(columnMappingHash != NULL);
+    
+    foreach(columnCell, columnList) {
+        Var *column = (Var *) lfirst(columnCell);
+        AttrNumber columnId = column->varattno;
+        
+        ColumnMapping *columnMapping = NULL;
+        char *columnName = NULL;
+        bool handleFound = false;
+        void *hashKey = NULL;
+        
+        columnName = get_relid_attribute_name(foreignTableId, columnId);
+        hashKey = (void *) columnName;
+        
+        columnMapping = (ColumnMapping *) hash_search(columnMappingHash, hashKey,
+                                                      HASH_ENTER, &handleFound);
+        Assert(columnMapping != NULL);
+        
+        columnMapping->columnIndex = columnId - 1;
+        columnMapping->columnTypeId = column->vartype;
+        columnMapping->columnTypeMod = column->vartypmod;
+        columnMapping->columnArrayTypeId = get_element_type(column->vartype);
+
+        elog(NOTICE, "Column %s %d", columnName, columnId);
+    }
+    
+    return columnMappingHash;
+}
+*/
+
+/**
+   Given a WhiteDB record, translates it to a PG Tuple.
+ */
+static void
+FillTupleSlot(void *db, void *record,
+              List *columnMappingList, Datum *columnValues, bool *columnNulls) {
+
+    wg_int numFields = wg_get_record_len(db, record);
+    ListCell *columnCell = NULL;
+            
+    foreach(columnCell, columnMappingList) {
+        ColumnMapping*          columnMapping = lfirst(columnCell);
+        Oid                     columnTypeId = InvalidOid;
+        Oid                     columnTypeMod = InvalidOid;
+        bool                    compatibleTypes = false;
+        int32                   columnIndex = 0;
+        wg_int                  data;
+        wg_int                  wgType;
+
+        if (columnMapping == NULL) {
+            continue;
+        }
+
+        columnIndex = columnMapping->columnIndex;
+        columnTypeMod = columnMapping->columnTypeMod;
+        columnTypeId = columnMapping->columnTypeId;
+
+        // Don't go off the end of this record.
+        if (columnIndex >= numFields) {
+            continue;
+        }
+
+        data = wg_get_field(db, record, columnIndex);
+        wgType = wg_get_field_type(db, record, columnIndex); // returns 0 when error
+        compatibleTypes = ColumnTypesCompatible(wgType, columnTypeId);
+
+        /* if types are incompatible, leave this column null */
+        if (!compatibleTypes) {
+            continue;
+        }
+        
+        // If we are here, we can actually populate the row now.
+        columnValues[columnIndex] = ColumnValue(db, data, columnTypeId, columnTypeMod);
+        columnNulls[columnIndex] = false;
+    }
+}
+
+/*
+ * ColumnTypesCompatible checks if the given WhiteDB type can be converted to the
+ * given PostgreSQL type. 
+ */
+static bool
+ColumnTypesCompatible(wg_int wgType, Oid columnTypeId)
+{
+        bool compatibleTypes = false;
+
+        /* we consider the PostgreSQL column type as authoritative */
+        switch(columnTypeId)
+        {
+                case INT2OID: case INT4OID:
+                case INT8OID: case FLOAT4OID:
+                case FLOAT8OID: case NUMERICOID:
+                {
+                        if (wgType == WG_INTTYPE || wgType == WG_DOUBLETYPE ||
+                                wgType == WG_FIXPOINTTYPE)
+                        {
+                                compatibleTypes = true;
+                        }
+                        break;
+                }
+                case BPCHAROID:
+                case VARCHAROID:
+                case TEXTOID:
+                {
+                        if (wgType == WG_STRTYPE)
+                        {
+                                compatibleTypes = true;
+                        }
+                        break;
+                }
+                default:
+                {
+                        /*
+                         * We currently error out on other data types. Some types such as
+                         * byte arrays are easy to add, but they need testing. 
+                         */
+                        ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                                                        errmsg("cannot convert wgtype type to column type"),
+                                                        errhint("Column type: %u", (uint32) columnTypeId)));
+                        break;
+                }
+        }
+
+        return compatibleTypes;
+}
+
+/*
+ * ColumnValue uses column type information to read the current value pointed to
+ * by the record and field, and converts this value to the corresponding PostgreSQL
+ * datum. The function then returns this datum.
+ */
+static Datum
+ColumnValue(void *db, wg_int data, Oid columnTypeId, int32 columnTypeMod)
+{
+        Datum columnValue = 0;
+
+        switch(columnTypeId)
+        {
+                case INT2OID:
+                {
+                    int16 value = (int16) wg_decode_int(db, data);
+                    columnValue = Int16GetDatum(value);
+                    break;
+                }
+                case INT4OID:
+                {
+                    int32 value = wg_decode_int(db, data);
+                    columnValue = Int32GetDatum(value);
+                    break;
+                }
+                case INT8OID:
+                {
+                    int64 value = wg_decode_int(db, data);
+                    columnValue = Int64GetDatum(value);
+                    break;
+                }
+                case FLOAT4OID:
+                {
+                    float4 value = (float4) wg_decode_fixpoint(db, data);
+                    columnValue = Float4GetDatum(value);
+                    break;
+                }
+                case FLOAT8OID:
+                {
+                    float8 value = wg_decode_double(db, data);
+                    columnValue = Float8GetDatum(value);
+                    break;
+                }
+                case NUMERICOID:
+                {
+                        float8 value = wg_decode_double(db, data);
+                        Datum valueDatum = Float8GetDatum(value);
+
+                        /* overlook type modifiers for numeric */
+                        columnValue = DirectFunctionCall1(float8_numeric, valueDatum);
+                        break;
+                }
+                case BPCHAROID:
+                {
+                    const char *value = wg_decode_str(db, data);
+                    Datum valueDatum = CStringGetDatum(value);
+
+                    columnValue = DirectFunctionCall3(bpcharin, valueDatum,
+                                                      ObjectIdGetDatum(InvalidOid),
+                                                      Int32GetDatum(columnTypeMod));
+                    break;
+                }
+                case VARCHAROID:
+                {
+                    const char *value = wg_decode_str(db, data);
+                    Datum valueDatum = CStringGetDatum(value);
+                    
+                    columnValue = DirectFunctionCall3(varcharin, valueDatum,
+                                                      ObjectIdGetDatum(InvalidOid),
+                                                      Int32GetDatum(columnTypeMod));
+                    break;
+                }
+                case TEXTOID:
+                {
+                        const char *value = wg_decode_str(db, data);
+                        columnValue = CStringGetTextDatum(value);
+                        break;
+                }
+                default:
+                {
+                        ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                                                        errmsg("cannot convert bson type to column type"),
+                                                        errhint("Column type: %u", (uint32) columnTypeId)));
+                        break;
+                }
+        }
+
+        return columnValue;
 }

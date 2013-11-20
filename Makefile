@@ -30,7 +30,7 @@ PG_CONFIG    = /home/ian/local/bin/pg_config
 SHLIB_LINK = -lwgdb -lsasl2
 
 CXXFLAGS = -I/home/ian/local/include -march=native -m64 -g -O0 -Wall -fPIC -fsigned-char -Wno-unused-but-set-variable -Wno-unused-but-set-parameter
-PG_CPPFLAGS = -DUSE_TRANSACTIONS
+PG_CPPFLAGS = --std=c99 -DUSE_TRANSACTIONS
 
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 
