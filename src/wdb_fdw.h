@@ -75,11 +75,13 @@ typedef struct {
 typedef struct {
     wdbTableOptions opt;
     void* db;
+    void* record;
     List* columnMappingList;
     Relation rel;
     MemoryContext temp_cxt; /* context for per-tuple temporary data */
     AttInMetadata* attinmeta;
     AttrNumber key_junk_no;
+    wg_int lock_id;
     bool has_returning;	/* is there a RETURNING clause? */
 } wdbFdwModifyState;
 
