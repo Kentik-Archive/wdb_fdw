@@ -47,11 +47,14 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "storage/fd.h"
+#include "access/sysattr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/lsyscache.h"
 #include "nodes/makefuncs.h"
+#include "nodes/relation.h"
+#include "parser/parsetree.h"
 #include "utils/memutils.h"
 
 #include "access/xact.h"
@@ -113,6 +116,49 @@ static bool wdbAnalyzeForeignTable(Relation relation,
         AcquireSampleRowsFunc *func,
         BlockNumber *totalpages);
 
+////// Modify Code
+static void wdbAddForeignUpdateTargets(Query *parsetree,
+        RangeTblEntry *target_rte,
+        Relation target_relation);
+
+static List *wdbPlanForeignModify(PlannerInfo *root,
+        ModifyTable *plan,
+        Index resultRelation,
+        int subplan_index);
+
+static void wdbBeginForeignModify(ModifyTableState *mtstate,
+        ResultRelInfo *rinfo,
+        List *fdw_private,
+        int subplan_index,
+        int eflags);
+
+static TupleTableSlot *wdbExecForeignInsert(EState *estate,
+        ResultRelInfo *rinfo,
+        TupleTableSlot *slot,
+        TupleTableSlot *planSlot);
+
+/**
+static TupleTableSlot *wdbExecForeignUpdate(EState *estate,
+        ResultRelInfo *rinfo,
+        TupleTableSlot *slot,
+        TupleTableSlot *planSlot);
+
+static TupleTableSlot *wdbExecForeignDelete(EState *estate,
+        ResultRelInfo *rinfo,
+        TupleTableSlot *slot,
+        TupleTableSlot *planSlot);
+*/
+
+static void wdbEndForeignModify(EState *estate,
+        ResultRelInfo *rinfo);
+
+static void wdbExplainForeignModify(ModifyTableState *mtstate,
+        ResultRelInfo *rinfo,
+        List *fdw_private,
+        int subplan_index,
+        struct ExplainState *es);
+
+// Hash table of DB connections.
 static HTAB *ConnectionHash = NULL;
 
 void initTableOptions(struct wdbTableOptions *table_options);
@@ -124,6 +170,9 @@ static List *ColumnMappingList(Oid foreignTableId, List *columnList);
 static Datum ColumnValue(void *db, wg_int data, Oid columnTypeId, int32 columnTypeMod);
 static void FillTupleSlot(void *db, void *record, List *columnMappingList, Datum *columnValues, bool *columnNulls);
 static bool ColumnTypesCompatible(wg_int wgType, Oid columnTypeId);
+
+static int FillWhiteDBRecord(void* db, void* record, List* columnInfo, Datum* columnValues, bool* columnNulls, int numFields);
+static wg_int EncodeDatum(void* db, Oid typeId, Datum datumValue);
 
 Datum
 wdb_fdw_handler(PG_FUNCTION_ARGS) {
@@ -145,19 +194,19 @@ wdb_fdw_handler(PG_FUNCTION_ARGS) {
 
     /* remainder are optional - use NULL if not required */
     /* support for insert / update / delete */
-    /**
+    
     fdwroutine->AddForeignUpdateTargets = wdbAddForeignUpdateTargets;
     fdwroutine->PlanForeignModify = wdbPlanForeignModify;
     fdwroutine->BeginForeignModify = wdbBeginForeignModify;
     fdwroutine->ExecForeignInsert = wdbExecForeignInsert;
-    fdwroutine->ExecForeignUpdate = wdbExecForeignUpdate;
-    fdwroutine->ExecForeignDelete = wdbExecForeignDelete;
+    //fdwroutine->ExecForeignUpdate = wdbExecForeignUpdate;
+    //fdwroutine->ExecForeignDelete = wdbExecForeignDelete;
     fdwroutine->EndForeignModify = wdbEndForeignModify;
-    */
+    
 
     /* support for EXPLAIN */
     fdwroutine->ExplainForeignScan = wdbExplainForeignScan;
-    //fdwroutine->ExplainForeignModify = wdbExplainForeignModify;
+    fdwroutine->ExplainForeignModify = wdbExplainForeignModify;
 
     /* support for ANALYSE */
     fdwroutine->AnalyzeForeignTable = wdbAnalyzeForeignTable;
@@ -433,7 +482,7 @@ wdbGetForeignPaths(PlannerInfo *root,
                                      NIL));  /* no fdw_private data */
 }
 
-
+///// Code for a scan of the table.
 
 static ForeignScan *
 wdbGetForeignPlan(PlannerInfo *root,
@@ -685,6 +734,296 @@ wdbEndForeignScan(ForeignScanState *node) {
 // @TODO -- taken out for now.
 
 static void
+wdbAddForeignUpdateTargets(Query *parsetree,
+                           RangeTblEntry *target_rte,
+                           Relation target_relation) {
+
+    Var*                        var;
+    const char*                 attrname;
+    TargetEntry*                tle;
+    
+    /*
+     * In wdb_fdw, what we need is the ctid, same as for a regular table.
+     */
+    
+    /* Make a Var representing the desired value */
+    var = makeVar(parsetree->resultRelation,
+                  SelfItemPointerAttributeNumber,
+                  TIDOID,
+                  -1,
+                  InvalidOid,
+                  0);
+    
+    /* Wrap it in a resjunk TLE with the right name ... */
+    attrname = "ctid";
+    
+    tle = makeTargetEntry((Expr *) var,
+                          list_length(parsetree->targetList) + 1,
+                          pstrdup(attrname),
+                          true);
+    
+    /* ... and add it to the query's targetlist */
+    parsetree->targetList = lappend(parsetree->targetList, tle);
+}
+
+static List * 
+wdbPlanForeignModify(PlannerInfo *root,
+        ModifyTable *plan,
+        Index resultRelation,
+        int subplan_index) {
+
+    /*
+     * Perform any additional planning actions needed for an insert, update,
+     * or delete on a foreign table. This function generates the FDW-private
+     * information that will be attached to the ModifyTable plan node that
+     * performs the update action. This private information must have the form
+     * of a List, and will be delivered to BeginForeignModify during the
+     * execution stage.
+     *
+     * root is the planner's global information about the query. plan is the
+     * ModifyTable plan node, which is complete except for the fdwPrivLists
+     * field. resultRelation identifies the target foreign table by its
+     * rangetable index. subplan_index identifies which target of the
+     * ModifyTable plan node this is, counting from zero; use this if you want
+     * to index into plan->plans or other substructure of the plan node.
+     *
+     * If the PlanForeignModify pointer is set to NULL, no additional
+     * plan-time actions are taken, and the fdw_private list delivered to
+     * BeginForeignModify will be NIL.
+     */
+
+    CmdType		operation = plan->operation;
+    RangeTblEntry*      rte = planner_rt_fetch(resultRelation, root);
+    Relation	        rel;
+    List*               columnMappingList = NIL;
+
+    /*
+     * Core code already has some lock on each rel being planned, so we can
+     * use NoLock here.
+     */
+    rel = heap_open(rte->relid, NoLock);
+
+    if (operation == CMD_INSERT){
+        TupleDesc	        tupdesc = RelationGetDescr(rel);
+        int                     attnum;
+        
+        for (attnum = 1; attnum <= tupdesc->natts; attnum++) {
+
+            ColumnMapping*      columnMapping = NULL;
+            Form_pg_attribute   attr = tupdesc->attrs[attnum - 1];
+        
+            //columnName = get_relid_attribute_name(foreignTableId, columnId);
+            columnMapping = (ColumnMapping *)palloc0(sizeof(ColumnMapping));
+            Assert(columnMapping != NULL);
+        
+            columnMapping->columnName = pstrdup(attr->attname.data);
+            columnMapping->columnIndex = attnum - 1;
+            columnMapping->columnTypeId = attr->atttypid;
+            columnMapping->columnTypeMod = attr->atttypmod;
+            columnMapping->columnArrayTypeId = InvalidOid;
+            
+            // Append to our list.
+            columnMappingList = lcons(columnMapping, columnMappingList);
+        }
+    }
+
+    heap_close(rel, NoLock);
+
+    return columnMappingList;
+}
+
+
+static void
+wdbExplainForeignModify(ModifyTableState *mtstate,
+        ResultRelInfo *rinfo,
+        List *fdw_private,
+        int subplan_index,
+        struct ExplainState *es) {
+    /*
+     * Print additional EXPLAIN output for a foreign table update. This
+     * function can call ExplainPropertyText and related functions to add
+     * fields to the EXPLAIN output. The flag fields in es can be used to
+     * determine what to print, and the state of the ModifyTableState node can
+     * be inspected to provide run-time statistics in the EXPLAIN ANALYZE
+     * case. The first four arguments are the same as for BeginForeignModify.
+     *
+     * If the ExplainForeignModify pointer is set to NULL, no additional
+     * information is printed during EXPLAIN.
+     */
+
+    elog(DEBUG1,"entering function %s",__func__);
+}
+
+
+static void
+wdbBeginForeignModify(ModifyTableState *mtstate,
+        ResultRelInfo *rinfo,
+        List *fdw_private,
+        int subplan_index,
+        int eflags) {
+    
+    /*
+     * Begin executing a foreign table modification operation. This routine is
+     * called during executor startup. It should perform any initialization
+     * needed prior to the actual table modifications. Subsequently,
+     * ExecForeignInsert, ExecForeignUpdate or ExecForeignDelete will be
+     * called for each tuple to be inserted, updated, or deleted.
+     *
+     * mtstate is the overall state of the ModifyTable plan node being
+     * executed; global data about the plan and execution state is available
+     * via this structure. rinfo is the ResultRelInfo struct describing the
+     * target foreign table. (The ri_FdwState field of ResultRelInfo is
+     * available for the FDW to store any private state it needs for this
+     * operation.) fdw_private contains the private data generated by
+     * PlanForeignModify, if any. subplan_index identifies which target of the
+     * ModifyTable plan node this is. eflags contains flag bits describing the
+     * executor's operating mode for this plan node.
+     *
+     * Note that when (eflags & EXEC_FLAG_EXPLAIN_ONLY) is true, this function
+     * should not perform any externally-visible actions; it should only do
+     * the minimum required to make the node state valid for
+     * ExplainForeignModify and EndForeignModify.
+     *
+     * If the BeginForeignModify pointer is set to NULL, no action is taken
+     * during executor startup.
+     */
+
+    wdbFdwModifyState*             fmstate;
+    EState*                        estate = mtstate->ps.state;
+    Relation                       rel = rinfo->ri_RelationDesc;
+
+    //CmdType                        operation = mtstate->operation;
+    //RangeTblEntry*                 rte;
+    //AttrNumber	                   n_params;
+    //Oid                            typefnoid;
+    //bool                           isvarlena;
+    //ListCell*                      lc;
+
+    /*
+     * Do nothing in EXPLAIN (no ANALYZE) case.  resultRelInfo->ri_FdwState
+     * stays NULL.
+     */
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+        return;
+    
+    /* Begin constructing wdbFdwModifyState. */
+    fmstate = (wdbFdwModifyState *) palloc0(sizeof(wdbFdwModifyState));
+    fmstate->rel = rel;
+    fmstate->db = NULL;
+
+    /* Open connection. */
+    initTableOptions(&(fmstate->opt));
+    getTableOptions(RelationGetRelid(rel), &(fmstate->opt));
+
+    fmstate->db = GetDatabase(&(fmstate->opt));
+    if (fmstate->db == NULL) {
+        elog(ERROR,"Could not connect to a WhiteDB Database");
+    }
+
+    /* Deconstruct fdw_private data. */
+    fmstate->columnMappingList = fdw_private;
+
+    /* Create context for per-tuple temp workspace. */    
+    fmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+                                              "postgres_fdw temporary data",
+                                              ALLOCSET_SMALL_MINSIZE,
+                                              ALLOCSET_SMALL_INITSIZE,
+                                              ALLOCSET_SMALL_MAXSIZE);
+
+    /* Prepare for input conversion of RETURNING results. */
+    if (fmstate->has_returning)
+        fmstate->attinmeta = TupleDescGetAttInMetadata(RelationGetDescr(rel));
+    
+    rinfo->ri_FdwState = fmstate;
+}
+
+static TupleTableSlot *
+wdbExecForeignInsert(EState *estate,
+                     ResultRelInfo *rinfo,
+                     TupleTableSlot *slot,
+                     TupleTableSlot *planSlot) {
+
+    /*
+     * Insert one tuple into the foreign table. estate is global execution
+     * state for the query. rinfo is the ResultRelInfo struct describing the
+     * target foreign table. slot contains the tuple to be inserted; it will
+     * match the rowtype definition of the foreign table. planSlot contains
+     * the tuple that was generated by the ModifyTable plan node's subplan; it
+     * differs from slot in possibly containing additional "junk" columns.
+     * (The planSlot is typically of little interest for INSERT cases, but is
+     * provided for completeness.)
+     *
+     * The return value is either a slot containing the data that was actually
+     * inserted (this might differ from the data supplied, for example as a
+     * result of trigger actions), or NULL if no row was actually inserted
+     * (again, typically as a result of triggers). The passed-in slot can be
+     * re-used for this purpose.
+     *
+     * The data in the returned slot is used only if the INSERT query has a
+     * RETURNING clause. Hence, the FDW could choose to optimize away
+     * returning some or all columns depending on the contents of the
+     * RETURNING clause. However, some slot must be returned to indicate
+     * success, or the query's reported rowcount will be wrong.
+     *
+     * If the ExecForeignInsert pointer is set to NULL, attempts to insert
+     * into the foreign table will fail with an error message.
+     *
+     */
+
+    wdbFdwModifyState*      fmstate = (wdbFdwModifyState *) rinfo->ri_FdwState;
+    TupleDesc               tupleDescriptor = slot->tts_tupleDescriptor;
+    Datum*                  columnValues = slot->tts_values;
+    bool*                   columnNulls = slot->tts_isnull;
+    List*                   columnInfo = fmstate->columnMappingList;
+    int32                   columnCount = tupleDescriptor->natts;
+    void*                   record;
+
+    elog(DEBUG1,"entering function %s",__func__);
+
+    // Create a new record
+    record = wg_create_record(fmstate->db, columnCount);
+    
+    // @TODO -- figure out how to populate the columnTypes pointer
+    if (record != NULL) {
+        if (FillWhiteDBRecord(fmstate->db, record, columnInfo, columnValues, columnNulls, columnCount) != columnCount) {
+            elog(ERROR, "Error from wdb: %s", "Could not update record");
+        }
+    } else {
+        elog(ERROR, "Could not insert into database");
+    }
+
+    return slot;
+}
+
+static void
+wdbEndForeignModify(EState *estate,
+        ResultRelInfo *rinfo) {
+    /*
+     * End the table update and release resources. It is normally not
+     * important to release palloc'd memory, but for example open files and
+     * connections to remote servers should be cleaned up.
+     *
+     * If the EndForeignModify pointer is set to NULL, no action is taken
+     * during executor shutdown.
+     */
+
+    wdbFdwModifyState *fmstate = (wdbFdwModifyState *) rinfo->ri_FdwState;
+
+    elog(DEBUG1,"entering function %s",__func__);
+
+    if(fmstate) {
+        if(fmstate->db) {
+            ReleaseDatabase(fmstate->db);
+            fmstate->db = NULL;
+        }
+    }
+
+    /* MemoryContexts will be deleted automatically. */
+}
+
+// Explain Analyze code here -- not much to do.
+
+static void
 wdbExplainForeignScan(ForeignScanState *node,
         struct ExplainState *es) {
     /*
@@ -817,6 +1156,43 @@ FillTupleSlot(void *db, void *record,
     }
 }
 
+/**
+   Given a PG Tuple, translate it to a WhiteDB record.
+
+   Returns number of fields set.
+ */
+static int
+FillWhiteDBRecord(void* db, void* record, List* columnMappingList,
+                  Datum* columnValues, bool* columnNulls, int numFields) {
+                
+    ListCell*              columnCell = NULL;
+    int                    i = 0;
+    
+    foreach(columnCell, columnMappingList) {
+        ColumnMapping*          columnMapping = lfirst(columnCell);
+        int32                   columnIndex = 0;
+        Oid                     columnTypeId = InvalidOid;
+
+        columnTypeId = columnMapping->columnTypeId;
+        columnIndex = columnMapping->columnIndex;
+
+        if (columnNulls[columnIndex]) {
+            // Not strictly needed.
+            wg_set_field(db, record, columnIndex, wg_encode_null(db, 0));
+        } else {
+            // Set the value;
+            wg_int data = EncodeDatum(db, columnTypeId, columnValues[columnIndex]);
+            if (data == WG_ILLEGAL) {
+                continue; // We can't encode this type of data.
+            }        
+            wg_set_field(db, record, columnIndex, data);
+        }
+        i++;
+    }
+
+    return i;
+}
+
 /*
  * ColumnTypesCompatible checks if the given WhiteDB type can be converted to the
  * given PostgreSQL type. 
@@ -872,85 +1248,147 @@ ColumnTypesCompatible(wg_int wgType, Oid columnTypeId)
  * datum. The function then returns this datum.
  */
 static Datum
-ColumnValue(void *db, wg_int data, Oid columnTypeId, int32 columnTypeMod)
-{
-        Datum columnValue = 0;
+ColumnValue(void *db, wg_int data, Oid columnTypeId, int32 columnTypeMod) {
+    Datum columnValue = 0;
 
-        switch(columnTypeId)
+    switch(columnTypeId) {
+    case INT2OID:
         {
-                case INT2OID:
-                {
-                    int16 value = (int16) wg_decode_int(db, data);
-                    columnValue = Int16GetDatum(value);
-                    break;
-                }
-                case INT4OID:
-                {
-                    int32 value = wg_decode_int(db, data);
-                    columnValue = Int32GetDatum(value);
-                    break;
-                }
-                case INT8OID:
-                {
-                    int64 value = wg_decode_int(db, data);
-                    columnValue = Int64GetDatum(value);
-                    break;
-                }
-                case FLOAT4OID:
-                {
-                    float4 value = (float4) wg_decode_fixpoint(db, data);
-                    columnValue = Float4GetDatum(value);
-                    break;
-                }
-                case FLOAT8OID:
-                {
-                    float8 value = wg_decode_double(db, data);
-                    columnValue = Float8GetDatum(value);
-                    break;
-                }
-                case NUMERICOID:
-                {
-                        float8 value = wg_decode_double(db, data);
-                        Datum valueDatum = Float8GetDatum(value);
-
-                        /* overlook type modifiers for numeric */
-                        columnValue = DirectFunctionCall1(float8_numeric, valueDatum);
-                        break;
-                }
-                case BPCHAROID:
-                {
-                    const char *value = wg_decode_str(db, data);
-                    Datum valueDatum = CStringGetDatum(value);
-
-                    columnValue = DirectFunctionCall3(bpcharin, valueDatum,
-                                                      ObjectIdGetDatum(InvalidOid),
-                                                      Int32GetDatum(columnTypeMod));
-                    break;
-                }
-                case VARCHAROID:
-                {
-                    const char *value = wg_decode_str(db, data);
-                    Datum valueDatum = CStringGetDatum(value);
-                    
-                    columnValue = DirectFunctionCall3(varcharin, valueDatum,
-                                                      ObjectIdGetDatum(InvalidOid),
-                                                      Int32GetDatum(columnTypeMod));
-                    break;
-                }
-                case TEXTOID:
-                {
-                        const char *value = wg_decode_str(db, data);
-                        columnValue = CStringGetTextDatum(value);
-                        break;
-                }
-                default:
-                {
-                        ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-                                                        errmsg("cannot convert bson type to column type"),
-                                                        errhint("Column type: %u", (uint32) columnTypeId)));
-                        break;
-                }
+            int16 value = (int16) wg_decode_int(db, data);
+            columnValue = Int16GetDatum(value);
+            break;
         }
+    case INT4OID:
+        {
+            int32 value = wg_decode_int(db, data);
+            columnValue = Int32GetDatum(value);
+            break;
+        }
+    case INT8OID:
+        {
+            int64 value = wg_decode_int(db, data);
+            columnValue = Int64GetDatum(value);
+            break;
+        }
+    case FLOAT4OID:
+        {
+            float4 value = (float4) wg_decode_fixpoint(db, data);
+            columnValue = Float4GetDatum(value);
+            break;
+        }
+    case FLOAT8OID:
+        {
+            float8 value = wg_decode_double(db, data);
+            columnValue = Float8GetDatum(value);
+            break;
+        }
+    case NUMERICOID:
+        {
+            float8 value = wg_decode_double(db, data);
+            Datum valueDatum = Float8GetDatum(value);
+            
+            /* overlook type modifiers for numeric */
+            columnValue = DirectFunctionCall1(float8_numeric, valueDatum);
+            break;
+        }
+    case BPCHAROID:
+        {
+            const char *value = wg_decode_str(db, data);
+            Datum valueDatum = CStringGetDatum(value);
+            
+            columnValue = DirectFunctionCall3(bpcharin, valueDatum,
+                                              ObjectIdGetDatum(InvalidOid),
+                                              Int32GetDatum(columnTypeMod));
+            break;
+        }
+    case VARCHAROID:
+        {
+            const char *value = wg_decode_str(db, data);
+            Datum valueDatum = CStringGetDatum(value);
+            
+            columnValue = DirectFunctionCall3(varcharin, valueDatum,
+                                              ObjectIdGetDatum(InvalidOid),
+                                              Int32GetDatum(columnTypeMod));
+            break;
+        }
+    case TEXTOID:
+        {
+            const char *value = wg_decode_str(db, data);
+            columnValue = CStringGetTextDatum(value);
+            break;
+        }
+    default:
+        {
+            ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                            errmsg("cannot convert bson type to column type"),
+                            errhint("Column type: %u", (uint32) columnTypeId)));
+            break;
+        }
+    }
+    
+    return columnValue;
+}
 
-        return columnValue;
+/*
+ * EncodeDatum encodes the constant as a wg_int
+ */
+static wg_int
+EncodeDatum(void* db, Oid typeId, Datum datumValue) {
+    wg_int      data = WG_ILLEGAL;
+    
+    switch(typeId) {
+    case INT2OID:
+        {
+            int16 value = DatumGetInt16(datumValue);
+            data = wg_encode_int(db, (wg_int) value);
+            break;
+        }
+    case INT4OID:
+        {
+            int32 value = DatumGetInt32(datumValue);
+            data = wg_encode_int(db, (wg_int) value);
+            break;
+        }
+    case INT8OID:
+        {
+            int64 value = DatumGetInt64(datumValue);
+            data = wg_encode_int(db, (wg_int) value);
+            break;
+        }
+    case FLOAT4OID:
+        {
+            float4 value = DatumGetFloat4(datumValue);
+            data = wg_encode_fixpoint(db, (double) value);
+            break;
+        }
+    case FLOAT8OID:
+        {
+            float8 value = DatumGetFloat8(datumValue);
+            data = wg_encode_double(db, (double) value);
+            break;
+        }
+    case BPCHAROID:
+    case VARCHAROID:
+    case TEXTOID:
+        {
+            char *outputString = NULL;
+            Oid outputFunctionId = InvalidOid;
+            bool typeVarLength = false;
+            
+            getTypeOutputInfo(typeId, &outputFunctionId, &typeVarLength);
+            outputString = OidOutputFunctionCall(outputFunctionId, datumValue);
+            
+            data = wg_encode_str(db, outputString, NULL);
+            break;
+        }
+    default:
+        {
+            /*
+             * We currently error out on other data types.
+             */
+            break;
+        }
+    }
+    
+    return data;
 }
